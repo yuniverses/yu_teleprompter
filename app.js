@@ -36,17 +36,38 @@ const elements = {
   speakBtn: document.getElementById("speakBtn"),
   stopSpeakBtn: document.getElementById("stopSpeakBtn"),
   speechStatus: document.getElementById("speechStatus"),
+  followHealthStatus: document.getElementById("followHealthStatus"),
   transcriptOutput: document.getElementById("transcriptOutput"),
   teleprompterContent: document.getElementById("teleprompterContent"),
 };
 
 const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+const AudioContextCtor = window.AudioContext || window.webkitAudioContext || null;
 const statusClasses = ["status-neutral", "status-success", "status-warning", "status-danger"];
 const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const RESTARTABLE_FOLLOW_ERRORS = new Set(["aborted", "audio-capture", "network", "no-speech"]);
-const FOLLOW_WATCHDOG_INTERVAL_MS = 3000;
-const FOLLOW_STALL_TIMEOUT_MS = 18000;
-const FOLLOW_SESSION_REFRESH_MS = 55000;
+const FOLLOW_WATCHDOG_INTERVAL_MS = 1000;
+const FOLLOW_STARTUP_STALL_TIMEOUT_MS = 6000;
+const FOLLOW_RUNTIME_STALL_TIMEOUT_MS = 12000;
+const FOLLOW_VOICE_STALL_TIMEOUT_MS = 4200;
+const FOLLOW_VOICE_RECENT_WINDOW_MS = 2400;
+const FOLLOW_RESTART_MIN_INTERVAL_MS = 750;
+const FOLLOW_MATCH_WINDOW_BACK_CHARS = 90;
+const FOLLOW_MATCH_WINDOW_FORWARD_CHARS = 360;
+const FOLLOW_MATCH_FALLBACK_BACK_CHARS = 200;
+const FOLLOW_MATCH_FALLBACK_FORWARD_CHARS = 920;
+const FOLLOW_MATCH_BACKWARD_PENALTY = 120;
+const VOICE_ACTIVITY_RMS_THRESHOLD = 0.03;
+const SCRIPT_STORAGE_KEY = "yu.teleprompter.script";
+const TRANSCRIPT_FINAL_MAX_CHARS = 1200;
+const DEFAULT_SCRIPT_TEXT = `各位觀眾大家好，歡迎來到今天的節目。
+今天我們會快速帶你看完這次版本更新重點。
+第一個重點是全螢幕錄影與提詞同步。
+第二個重點是語音跟隨，系統會判斷你講到哪一句。
+第三個重點是鏡像模式與快捷鍵操作。
+接下來我會先示範一般錄影流程。
+完成之後，再示範全螢幕模式下的實際使用情境。
+最後我會整理三個拍攝小技巧，讓眼神更自然。`;
 const RECORD_MIME_PREFERENCES = [
   "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
   "video/mp4;codecs=h264,mp4a.40.2",
@@ -78,13 +99,22 @@ const state = {
   followActive: false,
   followRestartTimerId: null,
   followWatchdogIntervalId: null,
-  followSessionRefreshTimerId: null,
   followRestartAttempts: 0,
+  followPendingRestart: false,
   followLastStartAt: 0,
   followLastResultAt: 0,
+  followLastVoiceAt: 0,
+  followLastRestartAt: 0,
   followConsecutiveStalls: 0,
   recognitionRunning: false,
+  followHealthSnapshot: "",
   recentTranscript: "",
+  transcriptFinalText: "",
+  transcriptInterimText: "",
+  voiceMonitorContext: null,
+  voiceMonitorSource: null,
+  voiceMonitorAnalyser: null,
+  voiceMonitorBuffer: null,
   ttsActive: false,
   fullscreenActive: false,
   fullscreenMirrorEnabled: false,
@@ -103,6 +133,90 @@ function setStatus(node, message, type = "neutral") {
   }
   node.classList.add(`status-${type}`);
   node.textContent = message;
+}
+
+function setFollowHealthStatus(message, type = "neutral") {
+  const snapshot = `${type}:${message}`;
+  if (snapshot === state.followHealthSnapshot) {
+    return;
+  }
+  state.followHealthSnapshot = snapshot;
+  setStatus(elements.followHealthStatus, message, type);
+}
+
+function updateFollowHealthIndicator(now = Date.now()) {
+  if (!SpeechRecognitionCtor) {
+    setFollowHealthStatus("語音引擎：此瀏覽器不支援語音識別", "warning");
+    return;
+  }
+  if (!state.autoFollowEnabled) {
+    setFollowHealthStatus("語音引擎：已關閉（可在全螢幕內開啟）", "neutral");
+    return;
+  }
+  if (!state.followActive) {
+    setFollowHealthStatus("語音引擎：待機中（預設自動跟隨已開啟）", "neutral");
+    return;
+  }
+  if (state.followPendingRestart) {
+    setFollowHealthStatus("語音引擎：重連中...", "warning");
+    return;
+  }
+  if (!state.recognitionRunning) {
+    setFollowHealthStatus("語音引擎：啟動中...", "neutral");
+    return;
+  }
+  if (!state.followLastResultAt) {
+    const elapsedSec = Math.max(0, Math.floor((now - state.followLastStartAt) / 1000));
+    setFollowHealthStatus(`語音引擎：已連線，等待第一句（${elapsedSec}s）`, "neutral");
+    return;
+  }
+
+  const elapsedMs = now - state.followLastResultAt;
+  const elapsedSec = Math.max(0, Math.floor(elapsedMs / 1000));
+  if (elapsedMs <= 2600) {
+    setFollowHealthStatus("語音引擎：連線正常（剛收到識別）", "success");
+    return;
+  }
+  if (elapsedMs < FOLLOW_RUNTIME_STALL_TIMEOUT_MS) {
+    setFollowHealthStatus(`語音引擎：連線中，最近識別 ${elapsedSec} 秒前`, "neutral");
+    return;
+  }
+  setFollowHealthStatus(`語音引擎：${elapsedSec} 秒無識別，正在檢查連線...`, "warning");
+}
+
+function readStoredScript() {
+  try {
+    return window.localStorage.getItem(SCRIPT_STORAGE_KEY);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function saveScriptDraft(text) {
+  try {
+    window.localStorage.setItem(SCRIPT_STORAGE_KEY, text);
+  } catch (_error) {
+    /* ignore storage errors */
+  }
+}
+
+function updateTranscriptDisplay() {
+  const finalPart = state.transcriptFinalText.trim();
+  const interimPart = state.transcriptInterimText.trim();
+
+  if (!finalPart && !interimPart) {
+    elements.transcriptOutput.textContent = "等待語音輸入...";
+    return;
+  }
+
+  const lines = [];
+  if (finalPart) {
+    lines.push(finalPart.slice(-TRANSCRIPT_FINAL_MAX_CHARS));
+  }
+  if (interimPart) {
+    lines.push(`▶ ${interimPart}`);
+  }
+  elements.transcriptOutput.textContent = lines.join("\n");
 }
 
 function getFullscreenElement() {
@@ -197,12 +311,12 @@ function renderScript() {
   if (!state.scriptLines.length) {
     const mainEmpty = document.createElement("p");
     mainEmpty.className = "empty";
-    mainEmpty.textContent = "请先加载提词稿。";
+    mainEmpty.textContent = "請先載入提詞稿。";
     elements.teleprompterContent.append(mainEmpty);
 
     const fullscreenEmpty = document.createElement("p");
     fullscreenEmpty.className = "empty";
-    fullscreenEmpty.textContent = "请先加载提词稿。";
+    fullscreenEmpty.textContent = "請先載入提詞稿。";
     elements.fullscreenTeleprompterContent.append(fullscreenEmpty);
     return;
   }
@@ -260,14 +374,14 @@ function getLineIndexFromNormIndex(normIndex) {
 }
 
 function refreshFullscreenHint() {
-  elements.fullscreenModeHint.textContent = getFullscreenElement() ? "按 Esc 可离开全螢幕" : "按按钮可离开全螢幕";
+  elements.fullscreenModeHint.textContent = getFullscreenElement() ? "按 Esc 可離開全螢幕" : "按按鈕可離開全螢幕";
 }
 
 function updateMirrorToggleUI() {
   const enabled = state.fullscreenMirrorEnabled;
   elements.fullscreenStage.classList.toggle("is-mirrored", enabled);
   elements.fullscreenMirrorToggleBtn.setAttribute("aria-pressed", enabled ? "true" : "false");
-  elements.fullscreenMirrorToggleBtn.textContent = enabled ? "镜像画面：开" : "镜像画面：关";
+  elements.fullscreenMirrorToggleBtn.textContent = enabled ? "鏡像畫面：開" : "鏡像畫面：關";
   elements.fullscreenMirrorToggleBtn.classList.toggle("btn-secondary", enabled);
   elements.fullscreenMirrorToggleBtn.classList.toggle("btn-ghost", !enabled);
 }
@@ -311,7 +425,7 @@ function setFullscreenStageActive(active) {
 }
 
 function updateFullscreenButton() {
-  elements.fullscreenBtn.textContent = state.fullscreenActive ? "离开全螢幕题词" : "开啟全螢幕题词";
+  elements.fullscreenBtn.textContent = state.fullscreenActive ? "離開全螢幕提詞" : "開啟全螢幕提詞";
 }
 
 function refreshPromptClasses(activeIndex) {
@@ -469,7 +583,9 @@ function resetPrompt() {
     return;
   }
   state.recentTranscript = "";
-  elements.transcriptOutput.textContent = "等待语音输入...";
+  state.transcriptFinalText = "";
+  state.transcriptInterimText = "";
+  updateTranscriptDisplay();
   setPromptByLineIndex(firstLine);
 }
 
@@ -495,27 +611,27 @@ function updateFollowToggleUI() {
 
   elements.fullscreenFollowToggleBtn.disabled = !recognitionAvailable;
   elements.fullscreenFollowToggleBtn.setAttribute("aria-pressed", enabled ? "true" : "false");
-  elements.fullscreenFollowToggleBtn.textContent = enabled ? "语音跟随：开" : "语音跟随：关";
+  elements.fullscreenFollowToggleBtn.textContent = enabled ? "語音跟隨：開" : "語音跟隨：關";
   elements.fullscreenFollowToggleBtn.classList.toggle("btn-secondary", enabled);
   elements.fullscreenFollowToggleBtn.classList.toggle("btn-ghost", !enabled);
 
   if (!recognitionAvailable) {
-    elements.fullscreenFollowHint.textContent = "浏览器不支援语音识别";
+    elements.fullscreenFollowHint.textContent = "瀏覽器不支援語音識別";
     return;
   }
   if (!canUseFollow) {
-    elements.fullscreenFollowHint.textContent = "请先加载提词稿";
+    elements.fullscreenFollowHint.textContent = "請先載入提詞稿";
     return;
   }
   if (enabled && state.followActive) {
-    elements.fullscreenFollowHint.textContent = "已自动跟随中";
+    elements.fullscreenFollowHint.textContent = "已自動跟隨中";
     return;
   }
   if (enabled) {
-    elements.fullscreenFollowHint.textContent = "预设已开启";
+    elements.fullscreenFollowHint.textContent = "預設已開啟";
     return;
   }
-  elements.fullscreenFollowHint.textContent = "目前已关闭";
+  elements.fullscreenFollowHint.textContent = "目前已關閉";
 }
 
 function maybeStartAutoFollow(force = false) {
@@ -535,13 +651,14 @@ function setAutoFollowEnabled(enabled, showMessage = true, forceStart = false) {
   state.autoFollowEnabled = enabled;
   if (enabled) {
     if (showMessage) {
-      setStatus(elements.speechStatus, "语音跟随已设为预设开启。", "success");
+      setStatus(elements.speechStatus, "語音跟隨已設為預設開啟。", "success");
     }
     maybeStartAutoFollow(forceStart);
   } else {
     stopFollowMode(showMessage);
   }
   updateFollowButtons();
+  updateFollowHealthIndicator();
 }
 
 function clearFollowRestartTimer() {
@@ -560,12 +677,80 @@ function clearFollowWatchdog() {
   state.followWatchdogIntervalId = null;
 }
 
-function clearFollowSessionRefreshTimer() {
-  if (!state.followSessionRefreshTimerId) {
+function stopVoiceMonitor() {
+  if (state.voiceMonitorSource) {
+    try {
+      state.voiceMonitorSource.disconnect();
+    } catch (_error) {
+      /* noop */
+    }
+  }
+  if (state.voiceMonitorAnalyser) {
+    try {
+      state.voiceMonitorAnalyser.disconnect();
+    } catch (_error) {
+      /* noop */
+    }
+  }
+  if (state.voiceMonitorContext) {
+    try {
+      state.voiceMonitorContext.close();
+    } catch (_error) {
+      /* noop */
+    }
+  }
+  state.voiceMonitorContext = null;
+  state.voiceMonitorSource = null;
+  state.voiceMonitorAnalyser = null;
+  state.voiceMonitorBuffer = null;
+}
+
+function startVoiceMonitor() {
+  stopVoiceMonitor();
+  if (!AudioContextCtor || !state.stream) {
     return;
   }
-  clearTimeout(state.followSessionRefreshTimerId);
-  state.followSessionRefreshTimerId = null;
+  const hasAudioTrack = Boolean(state.stream.getAudioTracks?.().length);
+  if (!hasAudioTrack) {
+    return;
+  }
+  try {
+    const context = new AudioContextCtor();
+    const source = context.createMediaStreamSource(state.stream);
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.18;
+    source.connect(analyser);
+    state.voiceMonitorContext = context;
+    state.voiceMonitorSource = source;
+    state.voiceMonitorAnalyser = analyser;
+    state.voiceMonitorBuffer = new Uint8Array(analyser.fftSize);
+    if (context.state === "suspended") {
+      context.resume().catch(() => {});
+    }
+  } catch (_error) {
+    stopVoiceMonitor();
+  }
+}
+
+function sampleVoiceLevel() {
+  if (!state.voiceMonitorAnalyser || !state.voiceMonitorBuffer) {
+    return null;
+  }
+  if (state.voiceMonitorContext && state.voiceMonitorContext.state === "suspended") {
+    state.voiceMonitorContext.resume().catch(() => {});
+  }
+  try {
+    state.voiceMonitorAnalyser.getByteTimeDomainData(state.voiceMonitorBuffer);
+  } catch (_error) {
+    return null;
+  }
+  let sum = 0;
+  for (let i = 0; i < state.voiceMonitorBuffer.length; i += 1) {
+    const centered = (state.voiceMonitorBuffer[i] - 128) / 128;
+    sum += centered * centered;
+  }
+  return Math.sqrt(sum / state.voiceMonitorBuffer.length);
 }
 
 function recreateRecognitionInstance() {
@@ -584,6 +769,10 @@ function restartRecognitionEngine(recreate = false, delayMs = 280) {
   if (!state.followActive) {
     return;
   }
+  const now = Date.now();
+  const minimumGapMs = Math.max(0, state.followLastRestartAt + FOLLOW_RESTART_MIN_INTERVAL_MS - now);
+  const safeDelayMs = Math.max(delayMs, minimumGapMs);
+  state.followPendingRestart = true;
   const previousRecognition = state.recognition;
   if (state.recognitionRunning && previousRecognition) {
     try {
@@ -597,69 +786,83 @@ function restartRecognitionEngine(recreate = false, delayMs = 280) {
     const recreated = recreateRecognitionInstance();
     if (!recreated) {
       state.followActive = false;
-      setStatus(elements.speechStatus, "语音识别引擎重建失败，请重新点击开始语音跟随。", "danger");
+      state.followPendingRestart = false;
+      setStatus(elements.speechStatus, "語音識別引擎重建失敗，請重新點擊開始語音跟隨。", "danger");
+      stopFollowMaintenance();
       updateFollowButtons();
+      updateFollowHealthIndicator();
       return;
     }
   }
   clearFollowRestartTimer();
-  scheduleFollowRestart(delayMs);
-}
-
-function scheduleFollowSessionRefresh(delayMs = FOLLOW_SESSION_REFRESH_MS) {
-  if (!state.followActive) {
-    return;
-  }
-  clearFollowSessionRefreshTimer();
-  state.followSessionRefreshTimerId = setTimeout(() => {
-    state.followSessionRefreshTimerId = null;
-    if (!state.followActive) {
-      return;
-    }
-    restartRecognitionEngine(true, 220);
-    scheduleFollowSessionRefresh(FOLLOW_SESSION_REFRESH_MS);
-  }, delayMs);
+  scheduleFollowRestart(safeDelayMs);
+  updateFollowHealthIndicator();
 }
 
 function checkFollowHealth() {
+  const now = Date.now();
+  updateFollowHealthIndicator(now);
   if (!state.followActive || !state.recognitionRunning) {
     return;
   }
-  const now = Date.now();
-  const baselineTs = Math.max(state.followLastResultAt, state.followLastStartAt);
+
+  const sampledVoice = sampleVoiceLevel();
+  if (sampledVoice !== null && sampledVoice >= VOICE_ACTIVITY_RMS_THRESHOLD) {
+    state.followLastVoiceAt = now;
+  }
+
+  const hasRecentVoice = state.followLastVoiceAt > 0 && now - state.followLastVoiceAt <= FOLLOW_VOICE_RECENT_WINDOW_MS;
+  const hasVoiceMonitor = Boolean(state.voiceMonitorAnalyser);
+  const resultGapMs = state.followLastResultAt ? now - state.followLastResultAt : now - state.followLastStartAt;
+  if (hasRecentVoice && resultGapMs >= FOLLOW_VOICE_STALL_TIMEOUT_MS) {
+    state.followConsecutiveStalls += 1;
+    setStatus(elements.speechStatus, "偵測到有聲音但沒有識別結果，正在快速重連...", "warning");
+    restartRecognitionEngine(true, 180);
+    return;
+  }
+  if (!state.followLastResultAt && hasVoiceMonitor && !hasRecentVoice) {
+    return;
+  }
+
+  const baselineTs = state.followLastResultAt || state.followLastStartAt;
   if (!baselineTs) {
     return;
   }
+  const stallTimeoutMs = state.followLastResultAt ? FOLLOW_RUNTIME_STALL_TIMEOUT_MS : FOLLOW_STARTUP_STALL_TIMEOUT_MS;
   const stalledMs = now - baselineTs;
-  if (stalledMs < FOLLOW_STALL_TIMEOUT_MS) {
+  if (stalledMs < stallTimeoutMs) {
     return;
   }
 
   state.followConsecutiveStalls += 1;
-  const shouldRecreate = state.followConsecutiveStalls >= 2;
+  const shouldRecreate = state.followConsecutiveStalls >= 2 || !state.followLastResultAt;
   const tone = shouldRecreate ? "warning" : "neutral";
-  setStatus(elements.speechStatus, "语音识别连接维护中，正在自动恢复...", tone);
+  setStatus(elements.speechStatus, "語音識別連線異常，正在自動恢復...", tone);
   restartRecognitionEngine(shouldRecreate, shouldRecreate ? 260 : 220);
 }
 
 function startFollowMaintenance() {
   clearFollowWatchdog();
-  clearFollowSessionRefreshTimer();
+  startVoiceMonitor();
+  checkFollowHealth();
   state.followWatchdogIntervalId = setInterval(checkFollowHealth, FOLLOW_WATCHDOG_INTERVAL_MS);
-  scheduleFollowSessionRefresh(FOLLOW_SESSION_REFRESH_MS);
 }
 
 function stopFollowMaintenance() {
   clearFollowRestartTimer();
   clearFollowWatchdog();
-  clearFollowSessionRefreshTimer();
+  stopVoiceMonitor();
+  updateFollowHealthIndicator();
 }
 
 function scheduleFollowRestart(delayMs = 550) {
   if (!state.followActive || !state.recognition) {
     return;
   }
+  state.followPendingRestart = true;
+  state.followLastRestartAt = Date.now();
   clearFollowRestartTimer();
+  updateFollowHealthIndicator();
   state.followRestartTimerId = setTimeout(() => {
     state.followRestartTimerId = null;
     if (!state.followActive) {
@@ -732,7 +935,7 @@ function getActiveVideoTrackSettings(stream) {
 
 function formatVideoSettings(settings) {
   if (!settings) {
-    return "未知分辨率";
+    return "未知解析度";
   }
   const width = settings.width || "?";
   const height = settings.height || "?";
@@ -843,7 +1046,7 @@ async function openBestQualityStream(videoDeviceId, audioDeviceId) {
     }
   }
 
-  throw lastError || new Error("无法取得可用视频流");
+  throw lastError || new Error("無法取得可用視訊串流");
 }
 
 function createMediaRecorderWithFallback(stream, preferredConfig, mimeType) {
@@ -866,6 +1069,7 @@ function syncFullscreenStream() {
 }
 
 function stopMediaTracks() {
+  stopVoiceMonitor();
   if (!state.stream) {
     return;
   }
@@ -890,7 +1094,7 @@ function buildSelectOptions(selectNode, devices, fallbackLabel) {
   if (!devices.length) {
     const option = document.createElement("option");
     option.value = "";
-    option.textContent = `没有可用${fallbackLabel}`;
+    option.textContent = `沒有可用${fallbackLabel}`;
     selectNode.append(option);
     selectNode.disabled = true;
     return;
@@ -904,7 +1108,7 @@ function buildSelectOptions(selectNode, devices, fallbackLabel) {
 
 async function refreshDeviceLists() {
   if (!navigator.mediaDevices?.enumerateDevices) {
-    setStatus(elements.recordStatus, "浏览器不支援设备枚举。", "warning");
+    setStatus(elements.recordStatus, "瀏覽器不支援設備列舉。", "warning");
     elements.cameraSelect.disabled = true;
     elements.micSelect.disabled = true;
     return;
@@ -913,13 +1117,13 @@ async function refreshDeviceLists() {
   const devices = await navigator.mediaDevices.enumerateDevices();
   const cameras = devices.filter((device) => device.kind === "videoinput");
   const microphones = devices.filter((device) => device.kind === "audioinput");
-  buildSelectOptions(elements.cameraSelect, cameras, "摄影机");
-  buildSelectOptions(elements.micSelect, microphones, "麦克风");
+  buildSelectOptions(elements.cameraSelect, cameras, "攝影機");
+  buildSelectOptions(elements.micSelect, microphones, "麥克風");
 }
 
 async function initMedia() {
   if (!navigator.mediaDevices?.getUserMedia) {
-    setStatus(elements.recordStatus, "浏览器不支援录影 API。", "danger");
+    setStatus(elements.recordStatus, "瀏覽器不支援錄影 API。", "danger");
     return;
   }
 
@@ -940,11 +1144,14 @@ async function initMedia() {
     syncFullscreenStream();
     await refreshDeviceLists();
     const qualityText = formatVideoSettings(state.activeVideoSettings);
-    setStatus(elements.recordStatus, `设备已就绪（${profileLabel}，${qualityText}），可以开始录影。`, "success");
+    setStatus(elements.recordStatus, `設備已就緒（${profileLabel}，${qualityText}），可以開始錄影。`, "success");
     updateRecordButtons();
     maybeStartAutoFollow();
+    if (state.followActive) {
+      startVoiceMonitor();
+    }
   } catch (error) {
-    setStatus(elements.recordStatus, `开启设备失败：${error.message}`, "danger");
+    setStatus(elements.recordStatus, `開啟設備失敗：${error.message}`, "danger");
   }
 }
 
@@ -955,7 +1162,7 @@ function handleRecordStop() {
   updateRecordButtons();
 
   if (!state.recordedChunks.length) {
-    setStatus(elements.recordStatus, "没有录到可用内容。", "warning");
+    setStatus(elements.recordStatus, "沒有錄到可用內容。", "warning");
     return;
   }
 
@@ -972,15 +1179,15 @@ function handleRecordStop() {
   elements.downloadLink.download = `teleprompter-recording-${Date.now()}.${outputExt}`;
   elements.downloadLink.classList.remove("hidden");
   const qualityInfo = state.activeRecordConfig
-    ? `${formatVideoSettings(state.activeRecordConfig)}，约 ${(state.activeRecordConfig.videoBitsPerSecond / 1_000_000).toFixed(1)} Mbps`
-    : "未知录制参数";
-  elements.recordResultMsg.textContent = `录影完成（${outputFormat}，${qualityInfo}），大小 ${(blob.size / (1024 * 1024)).toFixed(2)} MB。`;
-  setStatus(elements.recordStatus, "录影已结束，已生成可下载文件。", "success");
+    ? `${formatVideoSettings(state.activeRecordConfig)}，約 ${(state.activeRecordConfig.videoBitsPerSecond / 1_000_000).toFixed(1)} Mbps`
+    : "未知錄製參數";
+  elements.recordResultMsg.textContent = `錄影完成（${outputFormat}，${qualityInfo}），大小 ${(blob.size / (1024 * 1024)).toFixed(2)} MB。`;
+  setStatus(elements.recordStatus, "錄影已結束，已產生可下載檔案。", "success");
 }
 
 async function startRecording() {
   if (typeof MediaRecorder === "undefined") {
-    setStatus(elements.recordStatus, "浏览器不支援 MediaRecorder。", "danger");
+    setStatus(elements.recordStatus, "瀏覽器不支援 MediaRecorder。", "danger");
     return;
   }
 
@@ -1018,7 +1225,7 @@ async function startRecording() {
       }
     };
     state.mediaRecorder.onerror = (event) => {
-      const message = event.error?.message || "录影过程中发生错误。";
+      const message = event.error?.message || "錄影過程中發生錯誤。";
       setStatus(elements.recordStatus, message, "danger");
     };
     state.mediaRecorder.onstop = handleRecordStop;
@@ -1029,9 +1236,9 @@ async function startRecording() {
     const recordingQuality = formatVideoSettings(currentSettings);
     const bitrateText = (actualVideoBps / 1_000_000).toFixed(1);
     const formatLabel = getFormatLabelByMimeType(activeMimeType);
-    setStatus(elements.recordStatus, `录影中...（${formatLabel}，${recordingQuality}，${bitrateText} Mbps）`, "warning");
+    setStatus(elements.recordStatus, `錄影中...（${formatLabel}，${recordingQuality}，${bitrateText} Mbps）`, "warning");
   } catch (error) {
-    setStatus(elements.recordStatus, `无法开始录影：${error.message}`, "danger");
+    setStatus(elements.recordStatus, `無法開始錄影：${error.message}`, "danger");
   }
 }
 
@@ -1048,6 +1255,8 @@ function startRecognitionSafely() {
   }
 
   clearFollowRestartTimer();
+  state.followPendingRestart = false;
+  updateFollowHealthIndicator();
   try {
     state.recognition.start();
   } catch (error) {
@@ -1059,16 +1268,18 @@ function startRecognitionSafely() {
     if (error.name === "NotAllowedError" || error.name === "SecurityError") {
       state.followActive = false;
       state.followRestartAttempts = 0;
-      setStatus(elements.speechStatus, "麦克风权限被拒绝，无法继续语音跟随。", "danger");
+      state.followPendingRestart = false;
+      setStatus(elements.speechStatus, "麥克風權限被拒絕，無法繼續語音跟隨。", "danger");
       updateFollowButtons();
       stopFollowMaintenance();
+      updateFollowHealthIndicator();
       return;
     }
 
     state.followRestartAttempts += 1;
     const retryDelay = Math.min(2100, 500 + state.followRestartAttempts * 260);
     const recreate = state.followRestartAttempts >= 4;
-    setStatus(elements.speechStatus, "语音识别中断，正在尝试自动恢复...", "warning");
+    setStatus(elements.speechStatus, "語音識別中斷，正在嘗試自動恢復...", "warning");
     restartRecognitionEngine(recreate, retryDelay);
   }
 }
@@ -1081,7 +1292,7 @@ async function enterFullscreenMode() {
   if (!state.stream) {
     await initMedia();
     if (!state.stream) {
-      setStatus(elements.recordStatus, "无法进入全螢幕：请先允许相机权限。", "danger");
+      setStatus(elements.recordStatus, "無法進入全螢幕：請先允許相機權限。", "danger");
       return;
     }
   }
@@ -1106,12 +1317,12 @@ async function enterFullscreenMode() {
     const nativeFullscreen = await requestStageFullscreen();
     refreshFullscreenHint();
     if (nativeFullscreen) {
-      setStatus(elements.recordStatus, "已进入全螢幕题词模式。", "success");
+      setStatus(elements.recordStatus, "已進入全螢幕提詞模式。", "success");
     } else {
-      setStatus(elements.recordStatus, "浏览器不支援原生全螢幕，已开启沉浸题词模式。", "warning");
+      setStatus(elements.recordStatus, "瀏覽器不支援原生全螢幕，已開啟沉浸提詞模式。", "warning");
     }
   } catch (error) {
-    setStatus(elements.recordStatus, `原生全螢幕启动失败，已改为沉浸模式：${error.message}`, "warning");
+    setStatus(elements.recordStatus, `原生全螢幕啟動失敗，已改為沉浸模式：${error.message}`, "warning");
   }
 }
 
@@ -1127,7 +1338,7 @@ async function exitFullscreenMode(showMessage = true, fromFullscreenEvent = fals
   setFullscreenStageActive(false);
   updateFullscreenButton();
   if (showMessage && wasActive) {
-    setStatus(elements.recordStatus, "已离开全螢幕题词模式。", "neutral");
+    setStatus(elements.recordStatus, "已離開全螢幕提詞模式。", "neutral");
   }
 }
 
@@ -1153,7 +1364,7 @@ function handleFullscreenChange() {
   if (state.fullscreenActive) {
     setFullscreenStageActive(false);
     updateFullscreenButton();
-    setStatus(elements.recordStatus, "已离开全螢幕题词模式。", "neutral");
+    setStatus(elements.recordStatus, "已離開全螢幕提詞模式。", "neutral");
   }
 }
 
@@ -1169,28 +1380,39 @@ function createRecognition() {
   recognition.onstart = () => {
     state.recognitionRunning = true;
     state.followRestartAttempts = 0;
+    state.followPendingRestart = false;
     state.followLastStartAt = Date.now();
+    state.followLastVoiceAt = 0;
     state.followConsecutiveStalls = 0;
+    updateFollowHealthIndicator();
   };
 
   recognition.onresult = (event) => {
-    state.followLastResultAt = Date.now();
-    state.followConsecutiveStalls = 0;
     let interimText = "";
+    let hasAnyTranscript = false;
     for (let i = event.resultIndex; i < event.results.length; i += 1) {
       const transcript = event.results[i][0]?.transcript?.trim();
       if (!transcript) {
         continue;
       }
+      hasAnyTranscript = true;
       if (event.results[i].isFinal) {
-        processRecognizedText(transcript, true);
+        processRecognizedText(transcript);
+        state.transcriptFinalText = `${state.transcriptFinalText} ${transcript}`.trim();
+        if (state.transcriptFinalText.length > TRANSCRIPT_FINAL_MAX_CHARS * 2) {
+          state.transcriptFinalText = state.transcriptFinalText.slice(-TRANSCRIPT_FINAL_MAX_CHARS * 2);
+        }
       } else {
         interimText = `${interimText} ${transcript}`.trim();
       }
     }
-    if (interimText) {
-      processRecognizedText(interimText, false);
+    if (hasAnyTranscript) {
+      state.followLastResultAt = Date.now();
+      state.followConsecutiveStalls = 0;
     }
+    state.transcriptInterimText = interimText;
+    updateTranscriptDisplay();
+    updateFollowHealthIndicator();
   };
 
   recognition.onerror = (event) => {
@@ -1201,31 +1423,64 @@ function createRecognition() {
       stopFollowMaintenance();
       state.followActive = false;
       state.followRestartAttempts = 0;
-      setStatus(elements.speechStatus, "请允许麦克风权限，才能使用语音跟随。", "danger");
+      setStatus(elements.speechStatus, "請允許麥克風權限，才能使用語音跟隨。", "danger");
       updateFollowButtons();
+      updateFollowHealthIndicator();
       return;
     }
 
     if (RESTARTABLE_FOLLOW_ERRORS.has(event.error)) {
       const tone = event.error === "no-speech" ? "neutral" : "warning";
-      const message = event.error === "no-speech" ? "暂时没听到声音，持续待命中..." : "识别短暂中断，正在自动重连...";
+      const message = event.error === "no-speech" ? "暫時沒聽到聲音，持續待命中..." : "識別短暫中斷，正在自動重連...";
       setStatus(elements.speechStatus, message, tone);
       restartRecognitionEngine(false, event.error === "no-speech" ? 420 : 700);
       return;
     }
 
-    setStatus(elements.speechStatus, `语音识别异常：${event.error}`, "warning");
+    setStatus(elements.speechStatus, `語音識別異常：${event.error}`, "warning");
     restartRecognitionEngine(true, 850);
   };
 
   recognition.onend = () => {
     state.recognitionRunning = false;
-    if (state.followActive) {
+    if (state.followActive && !state.followPendingRestart) {
+      setStatus(elements.speechStatus, "語音識別已中斷，正在自動重連...", "warning");
       scheduleFollowRestart(520);
     }
+    updateFollowHealthIndicator();
   };
 
   return recognition;
+}
+
+function findClosestOccurrenceInRange(script, snippet, rangeStart, rangeEnd) {
+  if (!snippet.length || !script.length) {
+    return -1;
+  }
+  const minStart = Math.max(0, rangeStart);
+  const maxStart = Math.min(Math.max(0, script.length - snippet.length), rangeEnd - snippet.length);
+  if (maxStart < minStart) {
+    return -1;
+  }
+
+  let bestIndex = -1;
+  let bestScore = Number.POSITIVE_INFINITY;
+  let searchFrom = minStart;
+  while (searchFrom <= maxStart) {
+    const foundAt = script.indexOf(snippet, searchFrom);
+    if (foundAt === -1 || foundAt > maxStart) {
+      break;
+    }
+    const distance = Math.abs(foundAt - state.currentNormIndex);
+    const backwardPenalty = foundAt < state.currentNormIndex ? FOLLOW_MATCH_BACKWARD_PENALTY : 0;
+    const score = distance + backwardPenalty;
+    if (score < bestScore) {
+      bestScore = score;
+      bestIndex = foundAt;
+    }
+    searchFrom = foundAt + 1;
+  }
+  return bestIndex;
 }
 
 function findClosestOccurrence(snippet) {
@@ -1233,33 +1488,25 @@ function findClosestOccurrence(snippet) {
   if (!snippet || !script) {
     return -1;
   }
-
-  const nearStart = Math.max(0, state.currentNormIndex - 100);
-  const nearMatch = script.indexOf(snippet, nearStart);
-  if (nearMatch !== -1) {
-    return nearMatch;
+  const cursor = clampNumber(state.currentNormIndex, 0, script.length);
+  const nearStart = cursor - FOLLOW_MATCH_WINDOW_BACK_CHARS;
+  const nearEnd = cursor + FOLLOW_MATCH_WINDOW_FORWARD_CHARS;
+  const nearHit = findClosestOccurrenceInRange(script, snippet, nearStart, nearEnd);
+  if (nearHit !== -1) {
+    return nearHit;
   }
 
-  let bestIndex = -1;
-  let bestScore = Number.POSITIVE_INFINITY;
-  let searchFrom = 0;
-
-  while (searchFrom < script.length) {
-    const index = script.indexOf(snippet, searchFrom);
-    if (index === -1) {
-      break;
-    }
-    const distance = Math.abs(index - state.currentNormIndex);
-    const backwardPenalty = index < state.currentNormIndex ? 40 : 0;
-    const score = distance + backwardPenalty;
-    if (score < bestScore) {
-      bestScore = score;
-      bestIndex = index;
-    }
-    searchFrom = index + 1;
+  const forwardHit = findClosestOccurrenceInRange(
+    script,
+    snippet,
+    cursor,
+    cursor + FOLLOW_MATCH_FALLBACK_FORWARD_CHARS,
+  );
+  if (forwardHit !== -1) {
+    return forwardHit;
   }
 
-  return bestIndex;
+  return findClosestOccurrenceInRange(script, snippet, cursor - FOLLOW_MATCH_FALLBACK_BACK_CHARS, cursor);
 }
 
 function locateNormalizedPosition(normalizedSpeech) {
@@ -1288,24 +1535,20 @@ function locateNormalizedPosition(normalizedSpeech) {
   return null;
 }
 
-function processRecognizedText(text, isFinal) {
+function processRecognizedText(text) {
   const rolling = `${state.recentTranscript} ${text}`.trim().slice(-260);
-  elements.transcriptOutput.textContent = rolling || "等待语音输入...";
 
   const normalizedRolling = normalizeText(rolling);
   const matchedIndex = locateNormalizedPosition(normalizedRolling);
   if (matchedIndex !== null) {
     setPromptByNormIndex(matchedIndex);
   }
-
-  if (isFinal) {
-    state.recentTranscript = rolling.slice(-220);
-  }
+  state.recentTranscript = rolling.slice(-220);
 }
 
 function startFollowMode(showMessage = true) {
   if (!SpeechRecognitionCtor) {
-    setStatus(elements.speechStatus, "浏览器不支援 SpeechRecognition。", "warning");
+    setStatus(elements.speechStatus, "瀏覽器不支援 SpeechRecognition。", "warning");
     return;
   }
 
@@ -1320,22 +1563,28 @@ function startFollowMode(showMessage = true) {
     state.recognition = createRecognition();
   }
   if (!state.recognition) {
-    setStatus(elements.speechStatus, "语音识别初始化失败。", "danger");
+    setStatus(elements.speechStatus, "語音識別初始化失敗。", "danger");
     return;
   }
 
   state.recognition.lang = elements.languageSelect.value;
   state.followActive = true;
   state.followRestartAttempts = 0;
+  state.followPendingRestart = false;
   state.followLastStartAt = Date.now();
-  state.followLastResultAt = Date.now();
+  state.followLastResultAt = 0;
+  state.followLastVoiceAt = 0;
+  state.followLastRestartAt = 0;
   state.followConsecutiveStalls = 0;
   state.recentTranscript = "";
-  elements.transcriptOutput.textContent = "正在聆听...";
+  state.transcriptFinalText = "";
+  state.transcriptInterimText = "";
+  updateTranscriptDisplay();
   if (showMessage) {
-    setStatus(elements.speechStatus, "语音跟随已启动，开始讲话即可自动跳行。", "success");
+    setStatus(elements.speechStatus, "語音跟隨已啟動，開始說話即可自動跳行。", "success");
   }
   updateFollowButtons();
+  updateFollowHealthIndicator();
   startFollowMaintenance();
   startRecognitionSafely();
 }
@@ -1343,8 +1592,11 @@ function startFollowMode(showMessage = true) {
 function stopFollowMode(showMessage = true) {
   state.followActive = false;
   state.followRestartAttempts = 0;
+  state.followPendingRestart = false;
   state.followLastStartAt = 0;
   state.followLastResultAt = 0;
+  state.followLastVoiceAt = 0;
+  state.followLastRestartAt = 0;
   state.followConsecutiveStalls = 0;
   state.recognitionRunning = false;
   stopFollowMaintenance();
@@ -1356,14 +1608,15 @@ function stopFollowMode(showMessage = true) {
     }
   }
   if (showMessage) {
-    setStatus(elements.speechStatus, "语音跟随已停止。", "neutral");
+    setStatus(elements.speechStatus, "語音跟隨已停止。", "neutral");
   }
   updateFollowButtons();
+  updateFollowHealthIndicator();
 }
 
 function startTTS() {
   if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
-    setStatus(elements.speechStatus, "浏览器不支援文字转语音。", "warning");
+    setStatus(elements.speechStatus, "瀏覽器不支援文字轉語音。", "warning");
     return;
   }
   if (!state.scriptLines.length) {
@@ -1384,7 +1637,7 @@ function startTTS() {
     .trim();
 
   if (!utteranceText) {
-    setStatus(elements.speechStatus, "当前没有可朗读内容。", "warning");
+    setStatus(elements.speechStatus, "目前沒有可朗讀內容。", "warning");
     return;
   }
 
@@ -1396,7 +1649,7 @@ function startTTS() {
   utterance.onstart = () => {
     state.ttsActive = true;
     updateTTSButtons();
-    setStatus(elements.speechStatus, "TTS 朗读中...", "success");
+    setStatus(elements.speechStatus, "TTS 朗讀中...", "success");
   };
 
   utterance.onboundary = (event) => {
@@ -1411,13 +1664,13 @@ function startTTS() {
   utterance.onend = () => {
     state.ttsActive = false;
     updateTTSButtons();
-    setStatus(elements.speechStatus, "TTS 朗读结束。", "neutral");
+    setStatus(elements.speechStatus, "TTS 朗讀結束。", "neutral");
   };
 
   utterance.onerror = () => {
     state.ttsActive = false;
     updateTTSButtons();
-    setStatus(elements.speechStatus, "TTS 朗读失败，请检查浏览器语音引擎。", "danger");
+    setStatus(elements.speechStatus, "TTS 朗讀失敗，請檢查瀏覽器語音引擎。", "danger");
   };
 
   window.speechSynthesis.speak(utterance);
@@ -1431,16 +1684,18 @@ function stopTTS(showMessage = true) {
     window.speechSynthesis.cancel();
   }
   if (state.ttsActive && showMessage) {
-    setStatus(elements.speechStatus, "已停止 TTS 朗读。", "neutral");
+    setStatus(elements.speechStatus, "已停止 TTS 朗讀。", "neutral");
   }
   state.ttsActive = false;
   updateTTSButtons();
 }
 
 function loadScript() {
-  const raw = elements.scriptInput.value.trim();
+  const rawInput = elements.scriptInput.value;
+  saveScriptDraft(rawInput);
+  const raw = rawInput.trim();
   if (!raw) {
-    setStatus(elements.speechStatus, "提词稿不能为空。", "danger");
+    setStatus(elements.speechStatus, "提詞稿不能為空。", "danger");
     state.scriptLines = [];
     state.normalizedScript = "";
     state.currentLineIndex = -1;
@@ -1448,6 +1703,7 @@ function loadScript() {
     renderScript();
     updateFollowButtons();
     updateTTSButtons();
+    updateFollowHealthIndicator();
     return;
   }
 
@@ -1455,18 +1711,20 @@ function loadScript() {
   const searchableCount = state.scriptLines.filter((line) => line.searchable).length;
   if (!searchableCount || !state.normalizedScript.length) {
     renderScript();
-    setStatus(elements.speechStatus, "提词稿没有可识别内容，请调整文本。", "danger");
+    setStatus(elements.speechStatus, "提詞稿沒有可識別內容，請調整文本。", "danger");
     updateFollowButtons();
     updateTTSButtons();
+    updateFollowHealthIndicator();
     return;
   }
 
   renderScript();
   resetPrompt();
-  setStatus(elements.speechStatus, `已加载 ${searchableCount} 行，可开始语音跟随。`, "success");
+  setStatus(elements.speechStatus, `已載入 ${searchableCount} 行，可開始語音跟隨。`, "success");
   updateFollowButtons();
   updateTTSButtons();
   maybeStartAutoFollow();
+  updateFollowHealthIndicator();
 }
 
 function bindEvents() {
@@ -1502,6 +1760,9 @@ function bindEvents() {
   });
 
   elements.loadScriptBtn.addEventListener("click", loadScript);
+  elements.scriptInput.addEventListener("input", () => {
+    saveScriptDraft(elements.scriptInput.value);
+  });
   elements.startFollowBtn.addEventListener("click", () => setAutoFollowEnabled(true, true, true));
   elements.stopFollowBtn.addEventListener("click", () => setAutoFollowEnabled(false, true));
   elements.prevLineBtn.addEventListener("click", () => jumpRelativeLine(-1));
@@ -1521,9 +1782,10 @@ function bindEvents() {
     if (state.autoFollowEnabled) {
       maybeStartAutoFollow(wasFollowing);
     } else {
-      setStatus(elements.speechStatus, `识别语言已切换为 ${elements.languageSelect.options[elements.languageSelect.selectedIndex].text}。`, "neutral");
+      setStatus(elements.speechStatus, `識別語言已切換為 ${elements.languageSelect.options[elements.languageSelect.selectedIndex].text}。`, "neutral");
     }
     updateFollowButtons();
+    updateFollowHealthIndicator();
   });
 
   document.addEventListener("fullscreenchange", handleFullscreenChange);
@@ -1567,8 +1829,15 @@ function bindEvents() {
 }
 
 async function initialize() {
-  setStatus(elements.recordStatus, "尚未开启设备。", "neutral");
-  setStatus(elements.speechStatus, "尚未开始语音跟随。", "neutral");
+  setStatus(elements.recordStatus, "尚未開啟設備。", "neutral");
+  setStatus(elements.speechStatus, "尚未開始語音跟隨。", "neutral");
+  const storedScript = readStoredScript();
+  if (storedScript && storedScript.trim()) {
+    elements.scriptInput.value = storedScript;
+  } else {
+    elements.scriptInput.value = DEFAULT_SCRIPT_TEXT;
+    saveScriptDraft(DEFAULT_SCRIPT_TEXT);
+  }
   setFullscreenStageActive(false);
   updateRecordButtons();
   updateFollowButtons();
@@ -1576,18 +1845,20 @@ async function initialize() {
   updateFullscreenButton();
   updateMirrorToggleUI();
   syncFullscreenFontSize();
+  updateTranscriptDisplay();
+  updateFollowHealthIndicator();
   bindEvents();
 
   if (navigator.mediaDevices?.enumerateDevices) {
     try {
       await refreshDeviceLists();
     } catch (_error) {
-      setStatus(elements.recordStatus, "读取设备清单失败，请稍后再试。", "warning");
+      setStatus(elements.recordStatus, "讀取設備清單失敗，請稍後再試。", "warning");
     }
   }
 
   if (!SpeechRecognitionCtor) {
-    setStatus(elements.speechStatus, "当前浏览器不支援语音识别，请改用 Chrome 或 Edge。", "warning");
+    setStatus(elements.speechStatus, "目前瀏覽器不支援語音識別，請改用 Chrome 或 Edge。", "warning");
   }
 
   if (!("speechSynthesis" in window)) {
@@ -1596,6 +1867,7 @@ async function initialize() {
   }
 
   loadScript();
+  updateFollowHealthIndicator();
 }
 
 initialize();

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>录影提词机 Studio</title>
+  <title>錄影提詞機 Studio</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -16,10 +16,10 @@
     <header class="app-header animate-up">
       <div>
         <p class="eyebrow">Smart Prompt Recording</p>
-        <h1>录影提词机 Studio</h1>
-        <p class="subtitle">边讲边录，提词稿会依照你讲到的位置自动跳转</p>
+        <h1>錄影提詞機 Studio</h1>
+        <p class="subtitle">邊講邊錄，提詞稿會依照你講到的位置自動跳轉</p>
       </div>
-      <div class="header-tags" aria-label="技术能力">
+      <div class="header-tags" aria-label="技術能力">
         <span class="tag">MediaRecorder</span>
         <span class="tag">Speech-to-Text</span>
         <span class="tag">Text-to-Speech</span>
@@ -29,99 +29,104 @@
     <main class="layout">
       <section class="panel recorder-panel animate-up" aria-labelledby="recorder-title">
         <div class="panel-head">
-          <h2 id="recorder-title">录影控制</h2>
-          <p>先开启摄影机与麦克风，再开始录影。</p>
+          <h2 id="recorder-title">錄影控制</h2>
+          <p>先開啟攝影機與麥克風，再開始錄影。</p>
         </div>
 
         <div class="form-grid">
           <div class="input-group">
-            <label for="cameraSelect">摄影机</label>
+            <label for="cameraSelect">攝影機</label>
             <select id="cameraSelect" disabled></select>
           </div>
           <div class="input-group">
-            <label for="micSelect">麦克风</label>
+            <label for="micSelect">麥克風</label>
             <select id="micSelect" disabled></select>
           </div>
         </div>
 
         <div class="button-row">
-          <button id="initMediaBtn" class="btn btn-secondary" type="button">开启设备</button>
-          <button id="startRecordBtn" class="btn btn-primary" type="button" disabled>开始录影</button>
-          <button id="stopRecordBtn" class="btn btn-danger" type="button" disabled>停止录影</button>
-          <button id="fullscreenBtn" class="btn btn-ghost" type="button">开啟全螢幕题词</button>
+          <button id="initMediaBtn" class="btn btn-secondary" type="button">開啟設備</button>
+          <button id="startRecordBtn" class="btn btn-primary" type="button" disabled>開始錄影</button>
+          <button id="stopRecordBtn" class="btn btn-danger" type="button" disabled>停止錄影</button>
+          <button id="fullscreenBtn" class="btn btn-ghost" type="button">開啟全螢幕提詞</button>
         </div>
 
-        <p id="recordStatus" class="status status-neutral" aria-live="polite">尚未开启设备。</p>
-        <p class="timer">录制时长 <strong id="recordTimer">00:00</strong></p>
+        <p id="recordStatus" class="status status-neutral" aria-live="polite">尚未開啟設備。</p>
+        <p class="timer">錄製時長 <strong id="recordTimer">00:00</strong></p>
 
         <div class="video-wrap">
           <video id="previewVideo" class="video" autoplay playsinline muted></video>
         </div>
 
         <div class="result-card">
-          <h3>录影输出</h3>
+          <h3>錄影輸出</h3>
           <video id="playbackVideo" class="video" controls></video>
-          <a id="downloadLink" class="btn btn-secondary hidden" href="#" download>下载录影</a>
-          <p id="recordResultMsg" class="muted">暂无录影输出。</p>
+          <a id="downloadLink" class="btn btn-secondary hidden" href="#" download>下載錄影</a>
+          <p id="recordResultMsg" class="muted">暫無錄影輸出。</p>
         </div>
       </section>
 
       <section class="panel prompter-panel animate-up" aria-labelledby="prompter-title">
         <div class="panel-head">
-          <h2 id="prompter-title">提词机</h2>
-          <p>加载稿件后，系统会用语音识别追踪你讲到哪一行。</p>
+          <h2 id="prompter-title">提詞機</h2>
+          <p>載入稿件後，系統會用語音識別追蹤你講到哪一行。</p>
         </div>
 
         <div class="input-group">
-          <label for="languageSelect">识别语言</label>
+          <label for="languageSelect">識別語言</label>
           <select id="languageSelect">
             <option value="zh-TW">中文（繁體）</option>
-            <option value="zh-CN">中文（简体）</option>
+            <option value="zh-CN">中文（簡體）</option>
             <option value="en-US">English</option>
             <option value="ja-JP">日本語</option>
           </select>
         </div>
 
         <div class="input-group">
-          <label for="scriptInput">提词稿</label>
-          <textarea id="scriptInput" rows="8">大家好，欢迎来到今天的产品更新。
-这个版本的重点是录影和提词同步。
-你只要照着稿件讲，系统就会自动定位到你讲到的位置。
-最后，我会分享三个实际应用场景。</textarea>
-          <p class="muted">建议一行一句，识别会更稳。</p>
+          <label for="scriptInput">提詞稿</label>
+          <textarea id="scriptInput" rows="8">各位觀眾大家好，歡迎來到今天的節目。
+今天我們會快速帶你看完這次版本更新重點。
+第一個重點是全螢幕錄影與提詞同步。
+第二個重點是語音跟隨，系統會判斷你講到哪一句。
+第三個重點是鏡像模式與快捷鍵操作。
+接下來我會先示範一般錄影流程。
+完成之後，再示範全螢幕模式下的實際使用情境。
+最後我會整理三個拍攝小技巧，讓眼神更自然。</textarea>
+          <p class="muted">建議一行一句，識別會更穩。</p>
         </div>
 
         <div class="button-row">
-          <button id="loadScriptBtn" class="btn btn-primary" type="button">加载提词稿</button>
-          <button id="startFollowBtn" class="btn btn-secondary" type="button">开始语音跟随</button>
-          <button id="stopFollowBtn" class="btn btn-secondary" type="button" disabled>停止跟随</button>
+          <button id="loadScriptBtn" class="btn btn-primary" type="button">載入提詞稿</button>
+          <button id="startFollowBtn" class="btn btn-secondary" type="button">開始語音跟隨</button>
+          <button id="stopFollowBtn" class="btn btn-secondary" type="button" disabled>停止跟隨</button>
         </div>
 
         <div class="button-row">
           <button id="prevLineBtn" class="btn btn-ghost" type="button">上一行</button>
           <button id="nextLineBtn" class="btn btn-ghost" type="button">下一行</button>
-          <button id="resetPromptBtn" class="btn btn-ghost" type="button">回到开头</button>
-          <button id="speakBtn" class="btn btn-ghost" type="button">TTS 朗读预览</button>
-          <button id="stopSpeakBtn" class="btn btn-ghost" type="button" disabled>停止朗读</button>
+          <button id="resetPromptBtn" class="btn btn-ghost" type="button">回到開頭</button>
+          <button id="speakBtn" class="btn btn-ghost" type="button">TTS 朗讀預覽</button>
+          <button id="stopSpeakBtn" class="btn btn-ghost" type="button" disabled>停止朗讀</button>
         </div>
 
-        <p id="speechStatus" class="status status-neutral" aria-live="polite">尚未开始语音跟随。</p>
+        <p id="speechStatus" class="status status-neutral" aria-live="polite">尚未開始語音跟隨。</p>
+        <p id="followHealthStatus" class="status status-neutral" aria-live="polite">語音引擎：待機中（預設自動跟隨已開啟）</p>
 
         <div class="input-group">
-          <label for="transcriptOutput">实时识别</label>
-          <div id="transcriptOutput" class="transcript" role="status" aria-live="polite">等待语音输入...</div>
+          <label for="transcriptOutput">即時識別</label>
+          <div id="transcriptOutput" class="transcript" role="status" aria-live="polite">等待語音輸入...</div>
         </div>
 
-        <div id="teleprompterViewport" class="teleprompter" tabindex="0" aria-label="提词显示区">
+        <div id="teleprompterViewport" class="teleprompter" tabindex="0" aria-label="提詞顯示區">
           <div id="teleprompterContent" class="teleprompter-content">
-            <p class="empty">请先加载提词稿。</p>
+            <p class="empty">請先載入提詞稿。</p>
           </div>
         </div>
       </section>
     </main>
 
     <footer class="app-footer">
-      <p>提示：请使用最新版 Chrome 或 Edge，以获得最佳录影与语音识别效果。</p>
+      <p>提示：請使用最新版 Chrome 或 Edge，以獲得最佳錄影與語音識別效果。</p>
     </footer>
   </div>
 
@@ -129,23 +134,23 @@
     <video id="fullscreenVideo" class="fullscreen-video" autoplay playsinline muted></video>
     <div class="fullscreen-mask" aria-hidden="true"></div>
     <div class="fullscreen-overlay">
-      <p class="fullscreen-badge">全螢幕题词模式</p>
-      <div id="fullscreenTeleprompterViewport" class="fullscreen-teleprompter" tabindex="0" aria-label="全螢幕提词滚动区">
+      <p class="fullscreen-badge">全螢幕提詞模式</p>
+      <div id="fullscreenTeleprompterViewport" class="fullscreen-teleprompter" tabindex="0" aria-label="全螢幕提詞滾動區">
         <div id="fullscreenTeleprompterContent" class="fullscreen-teleprompter-content">
-          <p class="empty">请先加载提词稿。</p>
+          <p class="empty">請先載入提詞稿。</p>
         </div>
       </div>
       <div class="fullscreen-bottom-bar">
-        <p id="fullscreenModeHint" class="fullscreen-mode-hint">按 Esc 可离开全螢幕</p>
-        <div class="fullscreen-controls" aria-label="全螢幕提词设置">
-          <button id="fullscreenStartRecordBtn" class="btn btn-primary btn-mini" type="button">开始录影</button>
-          <button id="fullscreenStopRecordBtn" class="btn btn-danger btn-mini" type="button" disabled>停止录影</button>
-          <button id="fullscreenFollowToggleBtn" class="btn btn-secondary btn-mini" type="button" aria-pressed="true">语音跟随：开</button>
-          <button id="fullscreenMirrorToggleBtn" class="btn btn-ghost btn-mini" type="button" aria-pressed="false">镜像画面：关</button>
-          <span id="fullscreenFollowHint" class="follow-hint">预设已开启</span>
+        <p id="fullscreenModeHint" class="fullscreen-mode-hint">按 Esc 可離開全螢幕</p>
+        <div class="fullscreen-controls" aria-label="全螢幕提詞設定">
+          <button id="fullscreenStartRecordBtn" class="btn btn-primary btn-mini" type="button">開始錄影</button>
+          <button id="fullscreenStopRecordBtn" class="btn btn-danger btn-mini" type="button" disabled>停止錄影</button>
+          <button id="fullscreenFollowToggleBtn" class="btn btn-secondary btn-mini" type="button" aria-pressed="true">語音跟隨：開</button>
+          <button id="fullscreenMirrorToggleBtn" class="btn btn-ghost btn-mini" type="button" aria-pressed="false">鏡像畫面：關</button>
+          <span id="fullscreenFollowHint" class="follow-hint">預設已開啟</span>
           <label for="fullscreenFontSizeRange">字體大小</label>
-          <button id="fullscreenFontDownBtn" class="btn btn-ghost btn-mini" type="button" aria-label="减小字體">A-</button>
-          <input id="fullscreenFontSizeRange" type="range" min="24" max="92" step="2" value="52" aria-label="调整全螢幕提词字體大小">
+          <button id="fullscreenFontDownBtn" class="btn btn-ghost btn-mini" type="button" aria-label="縮小字體">A-</button>
+          <input id="fullscreenFontSizeRange" type="range" min="24" max="92" step="2" value="52" aria-label="調整全螢幕提詞字體大小">
           <button id="fullscreenFontUpBtn" class="btn btn-ghost btn-mini" type="button" aria-label="放大字體">A+</button>
           <span id="fullscreenFontSizeValue" class="font-size-value">52px</span>
         </div>
